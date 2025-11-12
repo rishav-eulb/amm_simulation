@@ -1,416 +1,657 @@
 """
-Core Automated Market Maker (AMM) Implementation
-Implements CPMM (Constant Product Market Maker) and configurable virtual AMM
+Main Simulation Runner
+Integrates LSTM, Q-learning, and AMM components for complete simulation
 """
 
 import numpy as np
-from typing import Tuple, Optional
+import pandas as pd
+from typing import Dict, Tuple
+import matplotlib.pyplot as plt
+import os
+
 import config
+from amm_core import (
+    create_amm, ConfigurableVirtualAMM, CPMM,
+    price_to_valuation, valuation_to_equilibrium_x, equilibrium_state_from_price
+)
+from lstm_model import create_lstm_predictor
+from qlearning_model import create_qlearning_agent, calculate_loss, expected_load_mc
+from data_utils import DataLoader, TradeGenerator
 
 
-class CPMM:
-    """
-    Constant Product Market Maker (x * y = c)
-    Base implementation following Uniswap V2/V3 principles
-    """
+class AMMSimulation:
+    """Complete AMM simulation with predictive capabilities"""
     
-    def __init__(self, liquidity_constant: float, initial_price: float):
+    def __init__(self, initial_price: float, liquidity_constant: float = None):
         """
-        Initialize CPMM with liquidity constant and initial price.
+        Initialize simulation
         
         Args:
-            liquidity_constant: The constant c in x*y=c formula
-            initial_price: Initial price of token X in terms of token Y
+            initial_price: Initial ETH price
+            liquidity_constant: Liquidity constant c (default from config)
         """
-        self.c = liquidity_constant
+        self.initial_price = initial_price
+        self.liquidity_constant = liquidity_constant or config.LIQUIDITY_CONSTANT
         
-        # Calculate initial reserves: x * y = c, and price = y/x
-        # So: x * (price * x) = c => x^2 = c/price
-        self.x = np.sqrt(self.c / initial_price)
-        self.y = self.c / self.x
+        # Create AMM instances
+        self.proposed_amm = create_amm(
+            self.liquidity_constant,
+            initial_price,
+            use_predictive=True
+        )
         
-        self.initial_x = self.x
-        self.initial_y = self.y
+        self.baseline_amm = create_amm(
+            self.liquidity_constant,
+            initial_price,
+            use_predictive=False
+        )
         
-    def get_price(self) -> float:
-        """Get current price of token X in terms of token Y"""
-        return self.y / self.x
-    
-    def get_reserves(self) -> Tuple[float, float]:
-        """Get current reserves"""
-        return self.x, self.y
-    
-    def swap_x_for_y(self, delta_x: float, fee: float = 0.0) -> float:
-        """
-        Swap delta_x of token X for token Y
+        # Create ML models
+        self.lstm_model = create_lstm_predictor()
+        self.qlearning_agent = create_qlearning_agent()
         
-        Args:
-            delta_x: Amount of token X to swap
-            fee: Trading fee (e.g., 0.003 for 0.3%)
-            
-        Returns:
-            Amount of token Y received
-        """
-        if delta_x <= 0:
-            return 0
+        # Valuation error tracking for uncertainty estimation
+        self.val_error_mae = 0.01  # Initial prior for sigma in valuation space
         
-        # Apply fee to input
-        delta_x_after_fee = delta_x * (1 - fee)
-        
-        # Calculate output: (x + δx) * (y - δy) = c
-        # δy = y - c/(x + δx)
-        new_x = self.x + delta_x_after_fee
-        new_y = self.c / new_x
-        delta_y = self.y - new_y
-        
-        # Update reserves
-        self.x = new_x
-        self.y = new_y
-        
-        return delta_y
-    
-    def swap_y_for_x(self, delta_y: float, fee: float = 0.0) -> float:
-        """
-        Swap delta_y of token Y for token X
-        
-        Args:
-            delta_y: Amount of token Y to swap
-            fee: Trading fee
-            
-        Returns:
-            Amount of token X received
-        """
-        if delta_y <= 0:
-            return 0
-        
-        delta_y_after_fee = delta_y * (1 - fee)
-        
-        new_y = self.y + delta_y_after_fee
-        new_x = self.c / new_y
-        delta_x = self.x - new_x
-        
-        self.x = new_x
-        self.y = new_y
-        
-        return delta_x
-    
-    def get_equilibrium_valuation(self, market_price: float) -> float:
-        """
-        Calculate equilibrium valuation v that minimizes v·x
-        Following Equation 1 from the paper
-        
-        Args:
-            market_price: Observed market price from oracle
-            
-        Returns:
-            Equilibrium valuation v
-        """
-        # For CPMM with f(x) = c/x:
-        # Equilibrium when df/dx = -v/(1-v)
-        # df/dx = -c/x^2, so: -c/x^2 = -v/(1-v)
-        # This gives: v = c/(x^2 + c)
-        
-        current_price = self.get_price()
-        # Using the optimization: v := min_x (v_obs · x)
-        # For CPMM: φ(v) = sqrt((1-v)/v)
-        # So: v = 1/(1 + current_price^2)
-        
-        v = 1 / (1 + current_price**2)
-        return v
-    
-    def calculate_divergence_loss(self, initial_value: float, 
-                                  current_price: float) -> float:
-        """
-        Calculate divergence (impermanent) loss
-        Following the paper's formula
-        
-        Args:
-            initial_value: Initial portfolio value
-            current_price: Current market price
-            
-        Returns:
-            Divergence loss amount
-        """
-        # Current value in the pool
-        current_value = self.x * current_price + self.y
-        
-        # Value if held outside pool
-        hold_value = self.initial_x * current_price + self.initial_y
-        
-        # Divergence loss
-        div_loss = hold_value - current_value
-        
-        return max(0, div_loss)  # Loss is positive
-    
-    def calculate_slippage(self, trade_size: float, is_buy: bool,
-                          fee: float = 0.0) -> float:
-        """
-        Calculate slippage for a given trade size
-        
-        Args:
-            trade_size: Size of trade in token X
-            is_buy: True if buying X, False if selling X
-            fee: Trading fee
-            
-        Returns:
-            Slippage amount
-        """
-        initial_price = self.get_price()
-        
-        # Make a copy to simulate trade without affecting state
-        temp_x, temp_y = self.x, self.y
-        
-        if is_buy:
-            # Calculate how much Y needed to get trade_size of X
-            new_x = self.x - trade_size
-            new_y = self.c / new_x
-            delta_y = new_y - self.y
-            expected_cost = trade_size * initial_price
-            actual_cost = delta_y
-            slippage = actual_cost - expected_cost
-        else:
-            # Calculate how much Y received for selling trade_size of X
-            new_x = self.x + trade_size
-            new_y = self.c / new_x
-            delta_y = self.y - new_y
-            expected_received = trade_size * initial_price
-            actual_received = delta_y
-            slippage = expected_received - actual_received
-        
-        # Restore state
-        self.x, self.y = temp_x, temp_y
-        
-        return abs(slippage)
-    
-    def get_capitalization(self, valuation: float) -> float:
-        """
-        Calculate total value of AMM holdings at given valuation
-        Following the paper's cap(x,v) formula
-        
-        Args:
-            valuation: Market valuation v
-            
-        Returns:
-            Total capitalization
-        """
-        return valuation * self.x + (1 - valuation) * self.y
-
-
-class ConfigurableVirtualAMM(CPMM):
-    """
-    Configurable Virtual AMM (cAMM) with predictive capabilities
-    Extends CPMM with pseudo-arbitrage and dynamic liquidity adjustment
-    """
-    
-    def __init__(self, liquidity_constant: float, initial_price: float):
-        super().__init__(liquidity_constant, initial_price)
-        self.liquidity_adjustments = []
-        
-    def pseudo_arbitrage(self, new_market_price: float) -> Tuple[float, float]:
-        """
-        Perform pseudo-arbitrage to move curve to new equilibrium
-        Following the paper's approach to eliminate divergence
-        
-        Args:
-            new_market_price: New market price from oracle
-            
-        Returns:
-            (adjustment_x, adjustment_y): Required adjustments to reserves
-        """
-        current_price = self.get_price()
-        
-        # Calculate new equilibrium point
-        # New reserves to match market price while maintaining c
-        new_x = np.sqrt(self.c / new_market_price)
-        new_y = self.c / new_x
-        
-        # Calculate adjustments needed
-        adjustment_x = new_x - self.x
-        adjustment_y = new_y - self.y
-        
-        # Apply adjustments
-        self.x = new_x
-        self.y = new_y
-        
-        # Track adjustments for liquidity provider incentives
-        self.liquidity_adjustments.append({
-            'adjustment_x': adjustment_x,
-            'adjustment_y': adjustment_y,
-            'price': new_market_price
-        })
-        
-        return adjustment_x, adjustment_y
-    
-    def calculate_expected_load(self, current_v: float, 
-                               future_v_distribution: np.ndarray,
-                               probabilities: np.ndarray) -> float:
-        """
-        Calculate expected load (divergence * slippage)
-        Following Equation 2 from the paper
-        
-        Args:
-            current_v: Current equilibrium valuation
-            future_v_distribution: Array of possible future valuations
-            probabilities: Probability distribution over future valuations
-            
-        Returns:
-            Expected load
-        """
-        total_load = 0
-        
-        for future_v, prob in zip(future_v_distribution, probabilities):
-            # Calculate divergence loss for this future state
-            div_loss = self._divergence_loss_between_v(current_v, future_v)
-            
-            # Calculate slippage loss for this future state
-            slip_loss = self._slippage_loss_between_v(current_v, future_v)
-            
-            # Load is product of divergence and slippage
-            load = div_loss * slip_loss
-            
-            # Weight by probability
-            total_load += prob * load
-        
-        return total_load
-    
-    def _divergence_loss_between_v(self, v1: float, v2: float) -> float:
-        """Calculate divergence loss between two valuations"""
-        # Following paper's loss_div formula
-        phi_v1 = self._phi(v1)
-        phi_v2 = self._phi(v2)
-        
-        loss = v2 * phi_v1[0] + (1 - v2) * phi_v1[1] - \
-               (v2 * phi_v2[0] + (1 - v2) * phi_v2[1])
-        
-        return abs(loss)
-    
-    def _slippage_loss_between_v(self, v1: float, v2: float) -> float:
-        """Calculate slippage loss between two valuations"""
-        # Following paper's loss_slip formula
-        phi_v1 = self._phi(v1)
-        phi_v2 = self._phi(v2)
-        
-        val_v2 = v2 * phi_v2[0] + (1 - v2) * phi_v2[1]
-        val_v1 = v2 * phi_v1[0] + (1 - v2) * phi_v1[1]
-        
-        loss = ((1 - v2) / (1 - v1)) * (val_v2 - val_v1)
-        
-        return abs(loss)
-    
-    def _phi(self, v: float) -> Tuple[float, float]:
-        """
-        Calculate φ(v) - the equilibrium state for valuation v
-        For CPMM: φ(v) = (sqrt((1-v)/v), sqrt(v/(1-v)))
-        """
-        if v <= 0 or v >= 1:
-            raise ValueError("Valuation v must be in (0,1)")
-        
-        x_eq = np.sqrt(self.c * (1 - v) / v)
-        y_eq = np.sqrt(self.c * v / (1 - v))
-        
-        return x_eq, y_eq
-    
-    def apply_predictive_liquidity(self, predicted_price: float, 
-                                   std_dev: float = None) -> dict:
-        """
-        Apply Gaussian incentive fee distribution centered on predicted price
-        Following the paper's predictive liquidity distribution
-        
-        Args:
-            predicted_price: Predicted future price v'_p
-            std_dev: Standard deviation for Gaussian distribution
-            
-        Returns:
-            Dictionary with liquidity distribution info
-        """
-        if std_dev is None:
-            std_dev = config.INCENTIVE_STD_DEV
-        
-        # Calculate predicted equilibrium valuation
-        v_p = 1 / (1 + predicted_price**2)
-        
-        # Create Gaussian distribution centered on v_p
-        # This will guide liquidity provider incentives
-        distribution_info = {
-            'predicted_price': predicted_price,
-            'predicted_valuation': v_p,
-            'std_dev': std_dev,
-            'center_x': np.sqrt(self.c * (1 - v_p) / v_p),
-            'center_y': np.sqrt(self.c * v_p / (1 - v_p))
+        # Initialize tracking
+        self.results = {
+            'proposed': {
+                'divergence_losses': [],
+                'slippage_losses': [],
+                'liquidity_utilizations': [],
+                'prices': [],
+                'reserves_x': [],
+                'reserves_y': []
+            },
+            'baseline': {
+                'divergence_losses': [],
+                'slippage_losses': [],
+                'liquidity_utilizations': [],
+                'prices': [],
+                'reserves_x': [],
+                'reserves_y': []
+            }
         }
         
-        return distribution_info
-    
-    def gaussian_incentive_fee(self, position: float, predicted_v: float,
-                               std_dev: float) -> float:
+    def train_lstm(self, train_prices: np.ndarray,
+                   alternative_signals: np.ndarray = None) -> dict:
         """
-        Calculate incentive fee based on Gaussian distribution
-        φ(x) = (1/(σ√(2π))) * exp(-0.5*((x-v'_p)/σ)^2)
+        Train LSTM on valuation space with features [v_obs, τ, ε].
+        During pretrain we pass ε = 0 (the RL loop will inject ε later).
         
         Args:
-            position: Current position/valuation
-            predicted_v: Predicted valuation v'_p (mean of distribution)
-            std_dev: Standard deviation σ_φ
+            train_prices: Training price data (will be converted to valuations)
+            alternative_signals: Alternative data signals (τ)
             
         Returns:
-            Incentive fee multiplier
+            Training history
         """
-        coefficient = 1 / (std_dev * np.sqrt(2 * np.pi))
-        exponent = -0.5 * ((position - predicted_v) / std_dev) ** 2
+        print("Training LSTM model (valuation space)...")
         
-        fee_multiplier = coefficient * np.exp(exponent)
+        # Convert prices to valuations: v = p/(1+p)
+        v_obs = np.array([price_to_valuation(p) for p in train_prices], dtype=np.float32)
+        print(f"Converted {len(train_prices)} prices to valuations")
+        print(f"Valuation range: [{v_obs.min():.6f}, {v_obs.max():.6f}]")
         
-        return fee_multiplier
+        # Default τ to zeros if not provided
+        if alternative_signals is None:
+            alternative_signals = np.zeros_like(v_obs, dtype=np.float32)
+        
+        # ε pretrain stream is zeros (RL loop will provide actual values)
+        gaussian_params = np.zeros_like(v_obs, dtype=np.float32)
+        
+        history = self.lstm_model.train(
+            prices=v_obs,  # Now valuations, not prices
+            alternative_signals=alternative_signals,
+            gaussian_params=gaussian_params,
+            epochs=config.LSTM_EPOCHS,
+            batch_size=config.LSTM_BATCH_SIZE
+        )
+        
+        print("LSTM training complete")
+        return history.history
     
-    def calculate_liquidity_utilization(self, trade_volume: float) -> float:
+    def train_qlearning(self, train_prices: np.ndarray,
+                       n_episodes: int = 100) -> list:
         """
-        Calculate liquidity utilization metric
-        Utilization = Trade Volume / Average Liquidity
+        Train Q-learning agent
         
         Args:
-            trade_volume: Total trade volume
+            train_prices: Training price data
+            n_episodes: Number of training episodes
             
         Returns:
-            Liquidity utilization ratio
+            List of episode losses
         """
-        avg_liquidity = np.sqrt(self.c)  # Geometric mean of reserves
-        return trade_volume / avg_liquidity
+        print("Training Q-learning agent...")
+        
+        episode_losses = []
+        
+        for episode in range(n_episodes):
+            episode_loss = 0
+            n_steps = 0
+            n_skipped = 0  # Track skipped steps for event-driven filtering
+            
+            # Reset recent predictions for this episode
+            self._recent_preds = []
+            
+            # Sample random starting point
+            start_idx = np.random.randint(
+                config.LSTM_WINDOW_SIZE,
+                len(train_prices) - config.Q_WINDOW_SIZE - 1
+            )
+            
+            for t in range(start_idx, min(start_idx + 1000, len(train_prices) - 1)):
+                # Event-driven stepping: only update at meaningful changes in valuation
+                curr_p = train_prices[t]
+                next_p = train_prices[t + 1]
+                v_t = price_to_valuation(curr_p)
+                v_tp1 = price_to_valuation(next_p)
+                
+                # Skip tiny changes in valuation (event-driven filtering)
+                if abs(v_tp1 - v_t) < config.BETA_V:
+                    n_skipped += 1
+                    continue
+                
+                # Get LSTM predictions for window (convert prices to valuations)
+                window_prices = train_prices[max(0, t - config.LSTM_WINDOW_SIZE):t]
+                
+                if len(window_prices) >= config.LSTM_WINDOW_SIZE:
+                    # Convert price window to valuation window for LSTM
+                    window_valuations = np.array([price_to_valuation(p) for p in window_prices], dtype=np.float32)
+                    
+                    # Calculate equilibrium valuation using correct formula: v = p/(1+p)
+                    current_price = train_prices[t]
+                    equilibrium_v = price_to_valuation(current_price)
+                    
+                    # Prepare preliminary state (using recent predictions from memory)
+                    # For first iteration, use equilibrium_v as placeholder
+                    if n_steps == 0:
+                        recent_predictions = [equilibrium_v] * config.Q_WINDOW_SIZE
+                    else:
+                        # Use stored predictions from previous steps
+                        if not hasattr(self, '_recent_preds'):
+                            self._recent_preds = [equilibrium_v] * config.Q_WINDOW_SIZE
+                        recent_predictions = self._recent_preds[-config.Q_WINDOW_SIZE:]
+                    
+                    # Need preliminary expected load for state preparation
+                    sigma_v = max(self.val_error_mae * config.PRED_NOISE_SCALE, 1e-4)
+                    preliminary_load = abs(recent_predictions[-1] - equilibrium_v) * sigma_v
+                    
+                    state = self.qlearning_agent.prepare_state(
+                        np.array(recent_predictions, dtype=np.float32),
+                        equilibrium_v,
+                        preliminary_load
+                    )
+                    
+                    # Get action and epsilon from DQN
+                    action, epsilon = self.qlearning_agent.get_action(state, training=True)
+                    
+                    # Build epsilon window: broadcast ε across the window if action==1
+                    eps_window = np.zeros(config.LSTM_WINDOW_SIZE, dtype=np.float32)
+                    if action == 1:
+                        eps_window[:] = epsilon  # Broadcast chosen ε across the window
+                    
+                    # NOW predict with LSTM using the epsilon from Q-learning action
+                    # This creates the interactive coupling: DQN → ε → LSTM → v'_p
+                    predicted_v = self.lstm_model.predict(
+                        window_valuations,
+                        recent_alt_signals=None,        # τ (alternative signals)
+                        recent_gauss_params=eps_window  # ε (Gaussian parameter from DQN)
+                    )
+                    
+                    # Update rolling valuation error (MAE) as uncertainty proxy
+                    if t > start_idx:
+                        # Get actual next valuation for error tracking
+                        next_price = train_prices[t]
+                        actual_v = price_to_valuation(next_price)
+                        err = abs(predicted_v - actual_v)
+                        # Exponential moving average for error tracking
+                        self.val_error_mae = 0.9 * self.val_error_mae + 0.1 * float(err)
+                    
+                    # Store prediction for next iteration's state
+                    if not hasattr(self, '_recent_preds'):
+                        self._recent_preds = []
+                    self._recent_preds.append(predicted_v)
+                    if len(self._recent_preds) > config.Q_WINDOW_SIZE:
+                        self._recent_preds.pop(0)
+                    
+                    # Calculate expected load via Monte Carlo around predicted mean v'
+                    expected_load = expected_load_mc(
+                        current_v=equilibrium_v,
+                        pred_mean_v=predicted_v,
+                        pred_sigma_v=sigma_v,
+                        c=self.liquidity_constant,
+                        n_samples=config.LOAD_MC_SAMPLES
+                    )
+
+                    # Verbose logging (can be disabled for production)
+                    if episode % 10 == 0 and n_steps < 5:  # Only log first few steps of every 10th episode
+                        print(f"  [Step {n_steps}] action: {action}, epsilon: {epsilon:.4f}, "
+                              f"equilibrium_v: {equilibrium_v:.6f}, predicted_v: {predicted_v:.6f}, "
+                              f"expected_load: {expected_load:.6f}, sigma_v: {sigma_v:.6f}")
+                    
+                    # Prepare updated state for next transition (with new prediction included)
+                    updated_predictions = self._recent_preds[-config.Q_WINDOW_SIZE:]
+                    updated_state = self.qlearning_agent.prepare_state(
+                        np.array(updated_predictions, dtype=np.float32),
+                        equilibrium_v,
+                        expected_load
+                    )
+                    
+                    # Calculate loss and reward using the ε-conditioned prediction
+                    loss = calculate_loss(predicted_v, equilibrium_v, expected_load)
+                    reward = self.qlearning_agent.calculate_reward(loss)
+                    
+                    # Next state (at t+1)
+                    next_price = train_prices[t + 1]
+                    next_equilibrium_v = price_to_valuation(next_price)
+                    # Recompute expected load for next state
+                    next_expected_load = expected_load_mc(
+                        current_v=next_equilibrium_v,
+                        pred_mean_v=predicted_v,  # Use current prediction as proxy
+                        pred_sigma_v=sigma_v,
+                        c=self.liquidity_constant,
+                        n_samples=config.LOAD_MC_SAMPLES
+                    )
+                    next_state = self.qlearning_agent.prepare_state(
+                        np.array(updated_predictions, dtype=np.float32),
+                        next_equilibrium_v,
+                        next_expected_load
+                    )
+                    
+                    # Train
+                    step_loss = self.qlearning_agent.train_step(
+                        state, action, reward, next_state, False
+                    )
+                    
+                    episode_loss += step_loss
+                    n_steps += 1
+            
+            # Update target network periodically
+            if episode % 10 == 0:
+                self.qlearning_agent.update_target_network()
+            
+            avg_loss = episode_loss / max(n_steps, 1)
+            episode_losses.append(avg_loss)
+            
+            # Calculate event-driven filtering efficiency
+            total_iters = n_steps + n_skipped
+            processing_rate = (n_steps / max(total_iters, 1)) * 100 if total_iters > 0 else 0
+            
+            if episode % 10 == 0:
+                print(f"Episode {episode}/{n_episodes}, Avg Loss: {avg_loss:.4f}, "
+                      f"Steps: {n_steps}, Skipped: {n_skipped} ({processing_rate:.1f}% processed), "
+                      f"Epsilon: {self.qlearning_agent.dqn.epsilon:.4f}")
+        
+        print("\nQ-learning training complete")
+        print(f"Event-driven filtering with BETA_V = {config.BETA_V}")
+        print(f"Final epsilon: {self.qlearning_agent.dqn.epsilon:.4f}")
+        print(f"Final valuation error MAE: {self.val_error_mae:.6f}")
+        return episode_losses
     
-    def calculate_liquidity_depth(self, price_impact_threshold: float = 0.01) -> float:
+    def simulate_episode(self, prices: np.ndarray,
+                        trades: list,
+                        use_proposed: bool = True) -> Dict:
         """
-        Calculate liquidity depth - max trade size for acceptable price impact
+        Simulate one episode of trading
         
         Args:
-            price_impact_threshold: Acceptable price impact (e.g., 0.01 for 1%)
+            prices: Price series
+            trades: List of (interval, size, is_buy) tuples
+            use_proposed: Whether to use proposed AMM (vs baseline)
             
         Returns:
-            Maximum trade size
+            Episode results
         """
-        initial_price = self.get_price()
-        target_price = initial_price * (1 + price_impact_threshold)
+        amm = self.proposed_amm if use_proposed else self.baseline_amm
+        results_key = 'proposed' if use_proposed else 'baseline'
         
-        # For buying X: find delta_x such that price increases by threshold
-        # New price = c/(x - delta_x)^2
-        target_x = np.sqrt(self.c / target_price)
-        max_trade_size = self.x - target_x
+        # Reset AMM to initial state
+        amm.x = amm.initial_x
+        amm.y = amm.initial_y
+        amm.c = amm.initial_x * amm.initial_y  # Reset liquidity constant
+        # Reset initial valuation to first price in test set (for divergence loss calculation)
+        amm.initial_v = price_to_valuation(prices[0])
+        amm.initial_price = prices[0]
         
-        return max_trade_size
+        # Track metrics
+        divergence_losses = []
+        slippage_losses = []
+        prices_tracked = []
+        
+        # Group trades by interval
+        trades_by_interval = {}
+        for interval, size, is_buy in trades:
+            if interval not in trades_by_interval:
+                trades_by_interval[interval] = []
+            trades_by_interval[interval].append((size, is_buy))
+        
+        # Simulate each interval
+        for t in range(len(prices)):
+            current_price = prices[t]
+            
+            # If using proposed AMM, apply pseudo-arbitrage
+            if use_proposed and t > 0:
+                amm.pseudo_arbitrage(current_price)
+            
+            # Execute trades for this interval
+            if t in trades_by_interval:
+                for size, is_buy in trades_by_interval[t]:
+                    if is_buy:
+                        # Buy X with Y
+                        received = amm.swap_y_for_x(
+                            size * current_price,
+                            fee=config.FEE_TIER
+                        )
+                    else:
+                        # Sell X for Y
+                        received = amm.swap_x_for_y(
+                            size,
+                            fee=config.FEE_TIER
+                        )
+                    
+                    # Calculate slippage for this trade
+                    slippage = amm.calculate_slippage(size, is_buy, config.FEE_TIER)
+                    slippage_losses.append(slippage)
+            
+            # Calculate divergence loss using valuation-based capitalization
+            # Following paper's cap(x,v) = v·x + (1-v)·y formula
+            div_loss = amm.calculate_divergence_loss(current_price)
+            divergence_losses.append(div_loss)
+            
+            # Track price
+            prices_tracked.append(amm.get_price())
+            
+            # Track reserves
+            self.results[results_key]['reserves_x'].append(amm.x)
+            self.results[results_key]['reserves_y'].append(amm.y)
+        
+        return {
+            'divergence_losses': divergence_losses,
+            'slippage_losses': slippage_losses,
+            'prices': prices_tracked,
+            'final_reserves': (amm.x, amm.y)
+        }
+    
+    def run_simulation(self, train_prices: np.ndarray,
+                      test_prices: np.ndarray) -> Dict:
+        """
+        Run complete simulation: train models, then evaluate
+        
+        Args:
+            train_prices: Training data
+            test_prices: Test data
+            
+        Returns:
+            Complete simulation results
+        """
+        print("="*60)
+        print("Starting AMM Simulation")
+        print("="*60)
+        
+        # Step 1: Train LSTM
+        lstm_history = self.train_lstm(train_prices)
+        
+        # Step 2: Train Q-learning
+        qlearning_losses = self.train_qlearning(train_prices, n_episodes=50)
+        
+        # Step 3: Generate trades
+        print("\nGenerating synthetic trades...")
+        trade_gen = TradeGenerator(np.sqrt(self.liquidity_constant))
+        trades = trade_gen.generate_market_impact_trades(test_prices)
+        print(f"Generated {len(trades)} trades")
+        
+        # Step 4: Simulate proposed AMM
+        print("\nSimulating proposed AMM...")
+        proposed_results = self.simulate_episode(test_prices, trades, use_proposed=True)
+        
+        # Step 5: Simulate baseline AMM
+        print("Simulating baseline AMM...")
+        baseline_results = self.simulate_episode(test_prices, trades, use_proposed=False)
+        
+        # Step 6: Calculate metrics
+        results = self.calculate_metrics(proposed_results, baseline_results, test_prices)
+        
+        print("\n" + "="*60)
+        print("Simulation Complete")
+        print("="*60)
+        
+        return results
+    
+    def calculate_metrics(self, proposed_results: Dict,
+                         baseline_results: Dict,
+                         test_prices: np.ndarray) -> Dict:
+        """
+        Calculate evaluation metrics
+        
+        Args:
+            proposed_results: Results from proposed AMM
+            baseline_results: Results from baseline AMM
+            test_prices: Test price series
+            
+        Returns:
+            Metrics dictionary
+        """
+        # Calculate average divergence loss
+        proposed_div = np.mean(proposed_results['divergence_losses'])
+        baseline_div = np.mean(baseline_results['divergence_losses'])
+        
+        # Calculate average slippage
+        proposed_slip = np.mean(proposed_results['slippage_losses']) if proposed_results['slippage_losses'] else 0
+        baseline_slip = np.mean(baseline_results['slippage_losses']) if baseline_results['slippage_losses'] else 0
+        
+        # Calculate liquidity utilization
+        total_volume = len(proposed_results['slippage_losses']) * np.sqrt(self.liquidity_constant) * 0.01
+        proposed_util = total_volume / np.sqrt(self.liquidity_constant)
+        baseline_util = total_volume / np.sqrt(self.liquidity_constant)
+        
+        # Calculate liquidity depth
+        proposed_depth = self.proposed_amm.calculate_liquidity_depth()
+        baseline_depth = self.baseline_amm.calculate_liquidity_depth()
+        
+        metrics = {
+            'divergence_loss': {
+                'proposed': proposed_div,
+                'baseline': baseline_div,
+                'improvement': (baseline_div - proposed_div) / baseline_div * 100
+            },
+            'slippage': {
+                'proposed': proposed_slip,
+                'baseline': baseline_slip,
+                'improvement': (baseline_slip - proposed_slip) / baseline_slip * 100 if baseline_slip > 0 else 0
+            },
+            'liquidity_utilization': {
+                'proposed': proposed_util,
+                'baseline': baseline_util
+            },
+            'liquidity_depth': {
+                'proposed': proposed_depth,
+                'baseline': baseline_depth
+            }
+        }
+        
+        self.print_metrics(metrics)
+        
+        return metrics
+    
+    def print_metrics(self, metrics: Dict):
+        """Print metrics in formatted way"""
+        print("\n" + "="*60)
+        print("EVALUATION METRICS")
+        print("="*60)
+        
+        print("\n1. DIVERGENCE LOSS:")
+        print(f"   Proposed AMM: {metrics['divergence_loss']['proposed']:.4f}")
+        print(f"   Baseline AMM: {metrics['divergence_loss']['baseline']:.4f}")
+        print(f"   Improvement:  {metrics['divergence_loss']['improvement']:.2f}%")
+        
+        print("\n2. SLIPPAGE:")
+        print(f"   Proposed AMM: {metrics['slippage']['proposed']:.4f}")
+        print(f"   Baseline AMM: {metrics['slippage']['baseline']:.4f}")
+        print(f"   Improvement:  {metrics['slippage']['improvement']:.2f}%")
+        
+        print("\n3. LIQUIDITY UTILIZATION:")
+        print(f"   Proposed AMM: {metrics['liquidity_utilization']['proposed']:.2%}")
+        print(f"   Baseline AMM: {metrics['liquidity_utilization']['baseline']:.2%}")
+        
+        print("\n4. LIQUIDITY DEPTH:")
+        print(f"   Proposed AMM: {metrics['liquidity_depth']['proposed']:.2f}")
+        print(f"   Baseline AMM: {metrics['liquidity_depth']['baseline']:.2f}")
+        
+        print("="*60)
+    
+    def plot_results(self, save_path: str = None):
+        """
+        Plot simulation results
+        
+        Args:
+            save_path: Path to save plots
+        """
+        fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+        
+        # Plot 1: Divergence loss comparison
+        ax = axes[0, 0]
+        proposed_div = self.results['proposed']['divergence_losses']
+        baseline_div = self.results['baseline']['divergence_losses']
+        
+        if proposed_div and baseline_div:
+            ax.plot(proposed_div, label='Proposed AMM', alpha=0.7)
+            ax.plot(baseline_div, label='Baseline AMM', alpha=0.7)
+            ax.set_title('Divergence Loss Over Time')
+            ax.set_xlabel('Time Step')
+            ax.set_ylabel('Divergence Loss')
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+        
+        # Plot 2: Price comparison
+        ax = axes[0, 1]
+        proposed_prices = self.results['proposed']['prices']
+        baseline_prices = self.results['baseline']['prices']
+        
+        if proposed_prices and baseline_prices:
+            ax.plot(proposed_prices, label='Proposed AMM', alpha=0.7)
+            ax.plot(baseline_prices, label='Baseline AMM', alpha=0.7)
+            ax.set_title('AMM Prices Over Time')
+            ax.set_xlabel('Time Step')
+            ax.set_ylabel('Price')
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+        
+        # Plot 3: Reserves X
+        ax = axes[1, 0]
+        proposed_x = self.results['proposed']['reserves_x']
+        baseline_x = self.results['baseline']['reserves_x']
+        
+        if proposed_x and baseline_x:
+            ax.plot(proposed_x, label='Proposed AMM', alpha=0.7)
+            ax.plot(baseline_x, label='Baseline AMM', alpha=0.7)
+            ax.set_title('Token X Reserves Over Time')
+            ax.set_xlabel('Time Step')
+            ax.set_ylabel('Reserves X')
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+        
+        # Plot 4: Reserves Y
+        ax = axes[1, 1]
+        proposed_y = self.results['proposed']['reserves_y']
+        baseline_y = self.results['baseline']['reserves_y']
+        
+        if proposed_y and baseline_y:
+            ax.plot(proposed_y, label='Proposed AMM', alpha=0.7)
+            ax.plot(baseline_y, label='Baseline AMM', alpha=0.7)
+            ax.set_title('Token Y Reserves Over Time')
+            ax.set_xlabel('Time Step')
+            ax.set_ylabel('Reserves Y')
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        
+        if save_path:
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+            print(f"\nPlot saved to: {save_path}")
+        else:
+            plt.savefig('/home/claude/amm_simulation/results/simulation_results.png',
+                       dpi=300, bbox_inches='tight')
+            print("\nPlot saved to: /home/claude/amm_simulation/results/simulation_results.png")
+        
+        plt.close()
+    
+    def save_models(self, directory: str = None):
+        """
+        Save trained models
+        
+        Args:
+            directory: Directory to save models
+        """
+        if directory is None:
+            directory = config.MODEL_PATH
+        
+        os.makedirs(directory, exist_ok=True)
+        
+        # Save LSTM
+        lstm_path = os.path.join(directory, 'lstm_model.keras')
+        self.lstm_model.save_model(lstm_path)
+        print(f"LSTM model saved to: {lstm_path}")
+        
+        # Save Q-learning
+        q_path = os.path.join(directory, 'qlearning_model.weights.h5')
+        self.qlearning_agent.save_model(q_path)
+        print(f"Q-learning model saved to: {q_path}")
 
 
-def create_amm(liquidity_constant: float, initial_price: float,
-               use_predictive: bool = True):
+def run_eth_simulation(eth_data_path: str = None,
+                       use_synthetic: bool = True) -> Dict:
     """
-    Factory function to create AMM instance
+    Main entry point to run ETH AMM simulation
     
     Args:
-        liquidity_constant: Liquidity constant c
-        initial_price: Initial price
-        use_predictive: Whether to use configurable virtual AMM
+        eth_data_path: Path to ETH price CSV
+        use_synthetic: Whether to use synthetic data
         
     Returns:
-        AMM instance
+        Simulation results
     """
-    if use_predictive:
-        return ConfigurableVirtualAMM(liquidity_constant, initial_price)
+    # Create output directories
+    os.makedirs(config.DATA_PATH, exist_ok=True)
+    os.makedirs(config.MODEL_PATH, exist_ok=True)
+    os.makedirs(config.RESULTS_PATH, exist_ok=True)
+    
+    # Load data
+    if use_synthetic or eth_data_path is None:
+        print("Generating synthetic ETH-like data...")
+        from data_utils import create_synthetic_eth_data
+        train_df, test_df, val_df = create_synthetic_eth_data()
     else:
-        return CPMM(liquidity_constant, initial_price)
+        print(f"Loading ETH data from: {eth_data_path}")
+        from data_utils import load_eth_data
+        train_df, test_df, val_df = load_eth_data(eth_data_path)
+    
+    train_prices = train_df['close'].values
+    test_prices = test_df['close'].values
+    
+    initial_price = train_prices[0]
+    
+    print(f"\nData loaded:")
+    print(f"  Train samples: {len(train_prices)} ({len(train_prices)/60:.1f} hours)")
+    print(f"  Test samples:  {len(test_prices)} ({len(test_prices)/60:.1f} hours)")
+    print(f"  Initial price: ${initial_price:.2f}")
+    print(f"  Liquidity constant: {config.LIQUIDITY_CONSTANT:,.0f}")
+    
+    # Create and run simulation
+    simulation = AMMSimulation(initial_price, config.LIQUIDITY_CONSTANT)
+    results = simulation.run_simulation(train_prices, test_prices)
+    
+    # Save models
+    simulation.save_models()
+    
+    # Plot results
+    simulation.plot_results()
+    
+    return results
+
+
+if __name__ == "__main__":
+    # Run simulation with synthetic data
+    results = run_eth_simulation(use_synthetic=False)
