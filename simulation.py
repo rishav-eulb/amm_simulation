@@ -10,9 +10,12 @@ import matplotlib.pyplot as plt
 import os
 
 import config
-from amm_core import create_amm, ConfigurableVirtualAMM, CPMM
+from amm_core import (
+    create_amm, ConfigurableVirtualAMM, CPMM,
+    price_to_valuation, valuation_to_equilibrium_x, equilibrium_state_from_price
+)
 from lstm_model import create_lstm_predictor
-from qlearning_model import create_qlearning_agent, calculate_loss
+from qlearning_model import create_qlearning_agent, calculate_loss, expected_load_mc
 from data_utils import DataLoader, TradeGenerator
 
 
@@ -47,6 +50,9 @@ class AMMSimulation:
         self.lstm_model = create_lstm_predictor()
         self.qlearning_agent = create_qlearning_agent()
         
+        # Valuation error tracking for uncertainty estimation
+        self.val_error_mae = 0.01  # Initial prior for sigma in valuation space
+        
         # Initialize tracking
         self.results = {
             'proposed': {
@@ -70,20 +76,34 @@ class AMMSimulation:
     def train_lstm(self, train_prices: np.ndarray,
                    alternative_signals: np.ndarray = None) -> dict:
         """
-        Train LSTM price predictor
+        Train LSTM on valuation space with features [v_obs, τ, ε].
+        During pretrain we pass ε = 0 (the RL loop will inject ε later).
         
         Args:
-            train_prices: Training price data
-            alternative_signals: Alternative data signals
+            train_prices: Training price data (will be converted to valuations)
+            alternative_signals: Alternative data signals (τ)
             
         Returns:
             Training history
         """
-        print("Training LSTM model...")
+        print("Training LSTM model (valuation space)...")
+        
+        # Convert prices to valuations: v = p/(1+p)
+        v_obs = np.array([price_to_valuation(p) for p in train_prices], dtype=np.float32)
+        print(f"Converted {len(train_prices)} prices to valuations")
+        print(f"Valuation range: [{v_obs.min():.6f}, {v_obs.max():.6f}]")
+        
+        # Default τ to zeros if not provided
+        if alternative_signals is None:
+            alternative_signals = np.zeros_like(v_obs, dtype=np.float32)
+        
+        # ε pretrain stream is zeros (RL loop will provide actual values)
+        gaussian_params = np.zeros_like(v_obs, dtype=np.float32)
         
         history = self.lstm_model.train(
-            train_prices,
+            prices=v_obs,  # Now valuations, not prices
             alternative_signals=alternative_signals,
+            gaussian_params=gaussian_params,
             epochs=config.LSTM_EPOCHS,
             batch_size=config.LSTM_BATCH_SIZE
         )
@@ -110,6 +130,10 @@ class AMMSimulation:
         for episode in range(n_episodes):
             episode_loss = 0
             n_steps = 0
+            n_skipped = 0  # Track skipped steps for event-driven filtering
+            
+            # Reset recent predictions for this episode
+            self._recent_preds = []
             
             # Sample random starting point
             start_idx = np.random.randint(
@@ -118,47 +142,122 @@ class AMMSimulation:
             )
             
             for t in range(start_idx, min(start_idx + 1000, len(train_prices) - 1)):
-                # Get LSTM predictions for window
+                # Event-driven stepping: only update at meaningful changes in valuation
+                curr_p = train_prices[t]
+                next_p = train_prices[t + 1]
+                v_t = price_to_valuation(curr_p)
+                v_tp1 = price_to_valuation(next_p)
+                
+                # Skip tiny changes in valuation (event-driven filtering)
+                if abs(v_tp1 - v_t) < config.BETA_V:
+                    n_skipped += 1
+                    continue
+                
+                # Get LSTM predictions for window (convert prices to valuations)
                 window_prices = train_prices[max(0, t - config.LSTM_WINDOW_SIZE):t]
                 
                 if len(window_prices) >= config.LSTM_WINDOW_SIZE:
-                    predicted_price = self.lstm_model.predict(window_prices)
+                    # Convert price window to valuation window for LSTM
+                    window_valuations = np.array([price_to_valuation(p) for p in window_prices], dtype=np.float32)
                     
-                    # Calculate equilibrium valuation
+                    # Calculate equilibrium valuation using correct formula: v = p/(1+p)
                     current_price = train_prices[t]
-                    equilibrium_v = 1 / (1 + current_price**2)
-                    predicted_v = 1 / (1 + predicted_price**2)
-                    print(f"equilibrium_v: {equilibrium_v}, predicated_v: {predicted_v} | predicted_price: {predicted_price}")
+                    equilibrium_v = price_to_valuation(current_price)
                     
-                    # Calculate expected load (simplified)
-                    expected_load = abs(predicted_v - equilibrium_v) * 0.1
-
-                    print(f"equilibrium_v: {equilibrium_v}, predicted_v: {predicted_v} "
-                      f"Epsilon: {self.qlearning_agent.dqn.epsilon:.4f}")
+                    # Prepare preliminary state (using recent predictions from memory)
+                    # For first iteration, use equilibrium_v as placeholder
+                    if n_steps == 0:
+                        recent_predictions = [equilibrium_v] * config.Q_WINDOW_SIZE
+                    else:
+                        # Use stored predictions from previous steps
+                        if not hasattr(self, '_recent_preds'):
+                            self._recent_preds = [equilibrium_v] * config.Q_WINDOW_SIZE
+                        recent_predictions = self._recent_preds[-config.Q_WINDOW_SIZE:]
                     
-                    # Prepare state
-                    recent_predictions = [predicted_v] * config.Q_WINDOW_SIZE
+                    # Need preliminary expected load for state preparation
+                    sigma_v = max(self.val_error_mae * config.PRED_NOISE_SCALE, 1e-4)
+                    preliminary_load = abs(recent_predictions[-1] - equilibrium_v) * sigma_v
+                    
                     state = self.qlearning_agent.prepare_state(
-                        np.array(recent_predictions),
+                        np.array(recent_predictions, dtype=np.float32),
+                        equilibrium_v,
+                        preliminary_load
+                    )
+                    
+                    # Get action and epsilon from DQN
+                    action, epsilon = self.qlearning_agent.get_action(state, training=True)
+                    
+                    # Build epsilon window: broadcast ε across the window if action==1
+                    eps_window = np.zeros(config.LSTM_WINDOW_SIZE, dtype=np.float32)
+                    if action == 1:
+                        eps_window[:] = epsilon  # Broadcast chosen ε across the window
+                    
+                    # NOW predict with LSTM using the epsilon from Q-learning action
+                    # This creates the interactive coupling: DQN → ε → LSTM → v'_p
+                    predicted_v = self.lstm_model.predict(
+                        window_valuations,
+                        recent_alt_signals=None,        # τ (alternative signals)
+                        recent_gauss_params=eps_window  # ε (Gaussian parameter from DQN)
+                    )
+                    
+                    # Update rolling valuation error (MAE) as uncertainty proxy
+                    if t > start_idx:
+                        # Get actual next valuation for error tracking
+                        next_price = train_prices[t]
+                        actual_v = price_to_valuation(next_price)
+                        err = abs(predicted_v - actual_v)
+                        # Exponential moving average for error tracking
+                        self.val_error_mae = 0.9 * self.val_error_mae + 0.1 * float(err)
+                    
+                    # Store prediction for next iteration's state
+                    if not hasattr(self, '_recent_preds'):
+                        self._recent_preds = []
+                    self._recent_preds.append(predicted_v)
+                    if len(self._recent_preds) > config.Q_WINDOW_SIZE:
+                        self._recent_preds.pop(0)
+                    
+                    # Calculate expected load via Monte Carlo around predicted mean v'
+                    expected_load = expected_load_mc(
+                        current_v=equilibrium_v,
+                        pred_mean_v=predicted_v,
+                        pred_sigma_v=sigma_v,
+                        c=self.liquidity_constant,
+                        n_samples=config.LOAD_MC_SAMPLES
+                    )
+
+                    # Verbose logging (can be disabled for production)
+                    if episode % 10 == 0 and n_steps < 5:  # Only log first few steps of every 10th episode
+                        print(f"  [Step {n_steps}] action: {action}, epsilon: {epsilon:.4f}, "
+                              f"equilibrium_v: {equilibrium_v:.6f}, predicted_v: {predicted_v:.6f}, "
+                              f"expected_load: {expected_load:.6f}, sigma_v: {sigma_v:.6f}")
+                    
+                    # Prepare updated state for next transition (with new prediction included)
+                    updated_predictions = self._recent_preds[-config.Q_WINDOW_SIZE:]
+                    updated_state = self.qlearning_agent.prepare_state(
+                        np.array(updated_predictions, dtype=np.float32),
                         equilibrium_v,
                         expected_load
                     )
                     
-                    # Get action
-                    action, epsilon = self.qlearning_agent.get_action(state, training=True)
-                    
-                    # Calculate loss and reward
+                    # Calculate loss and reward using the ε-conditioned prediction
                     loss = calculate_loss(predicted_v, equilibrium_v, expected_load)
                     reward = self.qlearning_agent.calculate_reward(loss)
-                    print(f"loss: {loss}, reward: {reward}")
                     
-                    # Next state
+                    # Next state (at t+1)
                     next_price = train_prices[t + 1]
-                    next_equilibrium_v = 1 / (1 + next_price**2)
+                    next_equilibrium_v = price_to_valuation(next_price)
+                    # Recompute expected load for next state
+                    next_expected_load = expected_load_mc(
+                        current_v=next_equilibrium_v,
+                        pred_mean_v=predicted_v,  # Use current prediction as proxy
+                        pred_sigma_v=sigma_v,
+                        c=self.liquidity_constant,
+                        n_samples=config.LOAD_MC_SAMPLES
+                    )
                     next_state = self.qlearning_agent.prepare_state(
-                        np.array(recent_predictions),
+                        np.array(updated_predictions, dtype=np.float32),
                         next_equilibrium_v,
-                        expected_load
+                        next_expected_load
                     )
                     
                     # Train
@@ -176,11 +275,19 @@ class AMMSimulation:
             avg_loss = episode_loss / max(n_steps, 1)
             episode_losses.append(avg_loss)
             
+            # Calculate event-driven filtering efficiency
+            total_iters = n_steps + n_skipped
+            processing_rate = (n_steps / max(total_iters, 1)) * 100 if total_iters > 0 else 0
+            
             if episode % 10 == 0:
                 print(f"Episode {episode}/{n_episodes}, Avg Loss: {avg_loss:.4f}, "
+                      f"Steps: {n_steps}, Skipped: {n_skipped} ({processing_rate:.1f}% processed), "
                       f"Epsilon: {self.qlearning_agent.dqn.epsilon:.4f}")
         
-        print("Q-learning training complete")
+        print("\nQ-learning training complete")
+        print(f"Event-driven filtering with BETA_V = {config.BETA_V}")
+        print(f"Final epsilon: {self.qlearning_agent.dqn.epsilon:.4f}")
+        print(f"Final valuation error MAE: {self.val_error_mae:.6f}")
         return episode_losses
     
     def simulate_episode(self, prices: np.ndarray,
@@ -200,9 +307,13 @@ class AMMSimulation:
         amm = self.proposed_amm if use_proposed else self.baseline_amm
         results_key = 'proposed' if use_proposed else 'baseline'
         
-        # Reset AMM
+        # Reset AMM to initial state
         amm.x = amm.initial_x
         amm.y = amm.initial_y
+        amm.c = amm.initial_x * amm.initial_y  # Reset liquidity constant
+        # Reset initial valuation to first price in test set (for divergence loss calculation)
+        amm.initial_v = price_to_valuation(prices[0])
+        amm.initial_price = prices[0]
         
         # Track metrics
         divergence_losses = []
@@ -244,9 +355,9 @@ class AMMSimulation:
                     slippage = amm.calculate_slippage(size, is_buy, config.FEE_TIER)
                     slippage_losses.append(slippage)
             
-            # Calculate divergence loss
-            initial_value = amm.initial_x * current_price + amm.initial_y
-            div_loss = amm.calculate_divergence_loss(initial_value, current_price)
+            # Calculate divergence loss using valuation-based capitalization
+            # Following paper's cap(x,v) = v·x + (1-v)·y formula
+            div_loss = amm.calculate_divergence_loss(current_price)
             divergence_losses.append(div_loss)
             
             # Track price
