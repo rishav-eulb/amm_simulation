@@ -14,8 +14,14 @@ import config
 
 class LSTMPricePredictor:
     """
-    LSTM model for predicting future market valuations
+    LSTM model for predicting future market valuations (in valuation space)
     Architecture: 1 LSTM layer with 100 units, window size of 50 intervals
+    
+    Note: This model operates in valuation space v ∈ (0,1), not raw price space.
+    Inputs are [v_obs, τ, ε] where:
+    - v_obs: observed valuations
+    - τ: alternative signals
+    - ε: Gaussian parameters from Q-learning
     """
     
     def __init__(self, window_size: int = None, lstm_units: int = None):
@@ -69,10 +75,10 @@ class LSTMPricePredictor:
                          alternative_signals: np.ndarray = None,
                          gaussian_params: np.ndarray = None) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Prepare sliding window sequences for LSTM training
+        Prepare sliding window sequences for LSTM training in valuation space
         
         Args:
-            prices: Array of historical prices (v_obs)
+            prices: Array of historical valuations v_obs (note: despite param name, these are valuations)
             alternative_signals: Alternative data signals (τ)
             gaussian_params: Gaussian input parameters from Q-learning (ε)
             
@@ -116,27 +122,25 @@ class LSTMPricePredictor:
     
     def normalize_data(self, data: np.ndarray) -> np.ndarray:
         """
-        Normalize data using min-max scaling
+        Normalize data for LSTM training.
+        
+        Since valuations are already bounded in (0,1), we use identity normalization
+        to avoid boundary bias that min-max scaling could introduce.
         
         Args:
-            data: Input data
+            data: Input data (valuations in [0,1])
             
         Returns:
-            Normalized data
+            Normalized data (identity transform for valuations)
         """
-        from sklearn.preprocessing import MinMaxScaler
-        
-        if self.scaler is None:
-            self.scaler = MinMaxScaler()
-            normalized = self.scaler.fit_transform(data.reshape(-1, 1))
-        else:
-            normalized = self.scaler.transform(data.reshape(-1, 1))
-        
-        return normalized.flatten()
+        # Valuations are already bounded (0,1); keep identity to avoid boundary bias
+        return data.astype(np.float32)
     
     def denormalize_data(self, data: np.ndarray) -> np.ndarray:
         """
-        Denormalize data back to original scale
+        Denormalize data back to original scale.
+        
+        Since we use identity normalization for valuations, this is also identity.
         
         Args:
             data: Normalized data
@@ -144,10 +148,8 @@ class LSTMPricePredictor:
         Returns:
             Original scale data
         """
-        if self.scaler is None:
-            raise ValueError("Must fit scaler before denormalizing")
-        
-        return self.scaler.inverse_transform(data.reshape(-1, 1)).flatten()
+        # Identity transform for valuations
+        return data.astype(np.float32)
     
     def train(self, prices: np.ndarray,
               alternative_signals: np.ndarray = None,
@@ -156,13 +158,13 @@ class LSTMPricePredictor:
               batch_size: int = None,
               validation_split: float = 0.2) -> keras.callbacks.History:
         """
-        Train LSTM model
+        Train LSTM model in valuation space
         Following Algorithm 2 from the paper
         
         Args:
-            prices: Historical prices
-            alternative_signals: Alternative data signals
-            gaussian_params: Gaussian parameters from Q-learning
+            prices: Historical valuations v_obs (despite param name, these should be valuations)
+            alternative_signals: Alternative data signals (τ)
+            gaussian_params: Gaussian parameters from Q-learning (ε)
             epochs: Number of training epochs
             batch_size: Batch size
             validation_split: Validation data split
@@ -176,7 +178,7 @@ class LSTMPricePredictor:
         epochs = epochs or config.LSTM_EPOCHS
         batch_size = batch_size or config.LSTM_BATCH_SIZE
         
-        # Normalize prices
+        # Normalize valuations (identity transform since already in [0,1])
         prices_normalized = self.normalize_data(prices)
         
         # Prepare sequences
@@ -201,15 +203,15 @@ class LSTMPricePredictor:
                 recent_alt_signals: np.ndarray = None,
                 recent_gauss_params: np.ndarray = None) -> float:
         """
-        Predict next price (v'_p)
+        Predict next valuation v'_p in valuation space
         
         Args:
-            recent_prices: Recent price history (window_size length)
-            recent_alt_signals: Recent alternative signals
-            recent_gauss_params: Recent Gaussian parameters
+            recent_prices: Recent valuation history (window_size length) - despite param name, these are valuations
+            recent_alt_signals: Recent alternative signals (τ)
+            recent_gauss_params: Recent Gaussian parameters (ε)
             
         Returns:
-            Predicted next price
+            Predicted next valuation v'_p
         """
         if self.model is None:
             raise ValueError("Model must be trained before prediction")
@@ -249,20 +251,21 @@ class LSTMPricePredictor:
         
         # Denormalize
         prediction = self.denormalize_data(np.array([prediction_normalized]))[0]
+        prediction = float(np.clip(prediction, config.MIN_V, config.MAX_V))
         
         return prediction
     
     def predict_multi_step(self, recent_prices: np.ndarray,
                            n_steps: int = 10) -> np.ndarray:
         """
-        Predict multiple steps ahead
+        Predict multiple steps ahead in valuation space
         
         Args:
-            recent_prices: Recent price history
+            recent_prices: Recent valuation history (despite param name)
             n_steps: Number of steps to predict ahead
             
         Returns:
-            Array of predicted prices
+            Array of predicted valuations
         """
         predictions = []
         current_window = recent_prices[-self.window_size:].copy()
@@ -289,14 +292,14 @@ class LSTMPricePredictor:
     def get_prediction_error(self, actual_prices: np.ndarray,
                             test_start_idx: int) -> dict:
         """
-        Calculate prediction errors on test set
+        Calculate prediction errors on test set in valuation space
         
         Args:
-            actual_prices: Actual price series
+            actual_prices: Actual valuation series (despite param name)
             test_start_idx: Index where test set starts
             
         Returns:
-            Dictionary with error metrics
+            Dictionary with error metrics (MAE, RMSE, MAPE)
         """
         test_prices = actual_prices[test_start_idx:]
         predictions = []
