@@ -9,8 +9,10 @@ import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers
 from collections import deque
+from typing import Tuple
 import random
 import config
+from amm_core import price_to_valuation, valuation_to_equilibrium_x
 
 
 class DuelingDQN:
@@ -369,6 +371,123 @@ def calculate_loss(predicted_valuation: float,
     total_loss = prediction_slippage + expected_load
     
     return total_loss
+
+
+def expected_load_mc(current_v: float,
+                     pred_mean_v: float,
+                     pred_sigma_v: float,
+                     c: float,
+                     n_samples: int = None) -> float:
+    """
+    Monte Carlo estimate of E_p[load(v')] using paper's formulas.
+    
+    load(v, v') = loss_div(v, v') * loss_slip(v, v')
+    
+    Where:
+    - loss_div(v, v') = v' · Φ(v) - v' · Φ(v')
+    - loss_slip(v, v') = ((1 - v') / (1 - v)) * (v' · Φ(v') - v' · Φ(v))
+    
+    We sample v' ~ N(pred_mean_v, pred_sigma_v²) and compute the expected load.
+    
+    Args:
+        current_v: Current equilibrium valuation
+        pred_mean_v: Predicted mean valuation from LSTM
+        pred_sigma_v: Uncertainty (standard deviation) in valuation prediction
+        c: Liquidity constant
+        n_samples: Number of Monte Carlo samples (defaults to config.LOAD_MC_SAMPLES)
+        
+    Returns:
+        Expected load E_p[load(v')]
+    """
+    n = n_samples or config.LOAD_MC_SAMPLES
+    
+    # Sample valuations with clipping to valid range
+    vs = np.random.normal(loc=pred_mean_v, scale=max(pred_sigma_v, 1e-6), size=n)
+    vs = np.clip(vs, config.MIN_V, config.MAX_V)
+    
+    # Current reference valuation
+    v0 = float(np.clip(current_v, config.MIN_V, config.MAX_V))
+    
+    loads = []
+    for v_prime in vs:
+        # Calculate ACTUAL divergence loss using paper formula
+        div_loss = _divergence_loss_between_v(v0, v_prime, c)
+        
+        # Calculate ACTUAL slippage loss using paper formula
+        slip_loss = _slippage_loss_between_v(v0, v_prime, c)
+        
+        # Load is the product (as per paper, page 9, Equation 2)
+        load = div_loss * slip_loss
+        loads.append(load)
+    
+    return float(np.mean(loads))
+
+
+def _phi(v: float, c: float) -> Tuple[float, float]:
+    """
+    Calculate φ(v) - the equilibrium state for valuation v
+    For CPMM: φ(v) = (sqrt(c*(1-v)/v), sqrt(c*v/(1-v)))
+    
+    Args:
+        v: Valuation in (0,1)
+        c: Liquidity constant
+        
+    Returns:
+        (x_eq, y_eq): Equilibrium reserves
+    """
+    v = float(np.clip(v, config.MIN_V, config.MAX_V))
+    x_eq = np.sqrt(c * (1 - v) / v)
+    y_eq = np.sqrt(c * v / (1 - v))
+    return x_eq, y_eq
+
+
+def _divergence_loss_between_v(v1: float, v2: float, c: float) -> float:
+    """
+    Calculate divergence loss between two valuations using paper formula.
+    loss_div(v, v') := v' · Φ(v) - v' · Φ(v')
+    
+    Args:
+        v1: Initial valuation
+        v2: Current valuation
+        c: Liquidity constant
+        
+    Returns:
+        Divergence loss
+    """
+    phi_v1 = _phi(v1, c)
+    phi_v2 = _phi(v2, c)
+    
+    # v' · Φ(v) = v'*x_eq(v) + (1-v')*y_eq(v)
+    cap_at_v1 = v2 * phi_v1[0] + (1 - v2) * phi_v1[1]
+    cap_at_v2 = v2 * phi_v2[0] + (1 - v2) * phi_v2[1]
+    
+    loss = cap_at_v1 - cap_at_v2
+    return abs(loss)
+
+
+def _slippage_loss_between_v(v1: float, v2: float, c: float) -> float:
+    """
+    Calculate slippage loss between two valuations using paper formula.
+    loss_slip(v, v') := ((1 - v') / (1 - v)) * (v' · Φ(v') - v' · Φ(v))
+    
+    Args:
+        v1: Initial valuation
+        v2: Current valuation
+        c: Liquidity constant
+        
+    Returns:
+        Slippage loss
+    """
+    phi_v1 = _phi(v1, c)
+    phi_v2 = _phi(v2, c)
+    
+    cap_at_v2 = v2 * phi_v2[0] + (1 - v2) * phi_v2[1]
+    cap_at_v1 = v2 * phi_v1[0] + (1 - v2) * phi_v1[1]
+    
+    ratio = (1 - v2) / (1 - v1 + 1e-12)  # Add small epsilon to avoid division by zero
+    loss = ratio * (cap_at_v2 - cap_at_v1)
+    
+    return abs(loss)
 
 
 def create_qlearning_agent(state_size: int = None) -> QLearningAgent:
