@@ -21,10 +21,10 @@ FEE_TIER = 0.003  # 0.3% (Uniswap V3 standard)
 # Time interval for data
 DATA_INTERVAL = '1min'  # 1-minute candles
 
-# Train/Test/Validation split
-TRAIN_HOURS = 7000
-TEST_HOURS = 2000
-VALIDATION_HOURS = 1000
+# Train/Test/Validation split (total: ~72k hours = 4.3M minutes)
+TRAIN_HOURS = 14000   # 70% of data (3M minutes)
+TEST_HOURS = 4000    # 21% of data (900k minutes)
+VALIDATION_HOURS = 2000  # 9% of data (420k minutes)
 
 # ============================================================================
 # LSTM PARAMETERS (from paper)
@@ -35,7 +35,7 @@ LSTM_UNITS = 100
 LSTM_WINDOW_SIZE = 50  # Number of historical intervals to look back
 
 # Training parameters
-LSTM_EPOCHS = 50
+LSTM_EPOCHS = 50  # Reduced from 50 (good enough, saves 5x time)
 LSTM_BATCH_SIZE = 32
 LSTM_LEARNING_RATE = 0.001
 
@@ -44,11 +44,11 @@ LSTM_LEARNING_RATE = 0.001
 # ============================================================================
 
 # Q-learning hyperparameters
-Q_LEARNING_RATE = 0.1
+Q_LEARNING_RATE = 0.001  # Conservative for stability (0.001 risks explosion)
 DISCOUNT_FACTOR = 0.98  # gamma
 EPSILON_START = 1.0  # Exploration rate
 EPSILON_MIN = 0.01
-EPSILON_DECAY = 0.995
+EPSILON_DECAY = 0.9995
 
 # DD-DQN architecture
 DQN_LAYER1_UNITS = 100
@@ -58,7 +58,7 @@ DQN_ADVANTAGE_UNITS = 50
 
 # Training parameters
 Q_EPOCHS = 50
-Q_BATCH_SIZE = 50
+Q_BATCH_SIZE = 16
 Q_WINDOW_SIZE = 10  # For Q-learning input
 
 # ============================================================================
@@ -66,8 +66,16 @@ Q_WINDOW_SIZE = 10  # For Q-learning input
 # ============================================================================
 
 # Threshold for prediction slippage and load tolerance
-BETA_C = 0.01  # β_c threshold for acceptable loss
-BETA_V = 0.0001  # β_v threshold for price-based events (0.01% from paper)
+BETA_C = 500  # β_c threshold for acceptable loss
+BETA_V = 0.00001  # β_v threshold for valuation-based events (event-step threshold in valuation space)
+
+# Monte Carlo and valuation parameters
+LOAD_MC_SAMPLES = 64  # Monte Carlo samples for E_p[load]
+PRED_NOISE_SCALE = 0.75  # scales sigma from LSTM val error to build p(v')
+
+# Valuation bounds (for numerical stability)
+MIN_V = 1e-6
+MAX_V = 1 - 1e-6
 
 # ============================================================================
 # LIQUIDITY PROVISION PARAMETERS
@@ -102,9 +110,11 @@ PRICE_IMPACT_THRESHOLD = 0.01  # 1% acceptable threshold
 # PATHS
 # ============================================================================
 
-DATA_PATH = '/home/claude/amm_simulation/data/'
-MODEL_PATH = '/home/claude/amm_simulation/models/'
-RESULTS_PATH = '/home/claude/amm_simulation/results/'
+import os
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_PATH = os.path.join(_BASE_DIR, 'data')
+MODEL_PATH = os.path.join(_BASE_DIR, 'models')
+RESULTS_PATH = os.path.join(_BASE_DIR, 'results')
 
 # ============================================================================
 # ADDITIONAL FEATURES
