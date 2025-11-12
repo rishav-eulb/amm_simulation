@@ -139,22 +139,6 @@ def run_with_your_data(csv_path: str):
         print("\n❌ CSV verification failed. Please check your data format.")
         return
     
-    # Ask for confirmation
-    print("\nReady to run simulation with your data.")
-    print("\nThis will:")
-    print("  1. Load your ETH price data")
-    print("  2. Train LSTM model (~5-10 minutes)")
-    print("  3. Train Q-learning agent (~5-10 minutes)")
-    print("  4. Compare proposed AMM vs baseline")
-    print("  5. Generate plots and metrics")
-    
-    response = input("\nContinue? (y/n): ").strip().lower()
-    
-    if response != 'y':
-        print("\nCancelled.")
-        return
-    
-    print(f"\n{'='*70}")
     print("🚀 Starting AMM Simulation")
     print(f"{'='*70}\n")
     
