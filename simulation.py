@@ -128,9 +128,13 @@ class AMMSimulation:
                     current_price = train_prices[t]
                     equilibrium_v = 1 / (1 + current_price**2)
                     predicted_v = 1 / (1 + predicted_price**2)
+                    print(f"equilibrium_v: {equilibrium_v}, predicated_v: {predicted_v} | predicted_price: {predicted_price}")
                     
                     # Calculate expected load (simplified)
                     expected_load = abs(predicted_v - equilibrium_v) * 0.1
+
+                    print(f"equilibrium_v: {equilibrium_v}, predicted_v: {predicted_v} "
+                      f"Epsilon: {self.qlearning_agent.dqn.epsilon:.4f}")
                     
                     # Prepare state
                     recent_predictions = [predicted_v] * config.Q_WINDOW_SIZE
@@ -146,6 +150,7 @@ class AMMSimulation:
                     # Calculate loss and reward
                     loss = calculate_loss(predicted_v, equilibrium_v, expected_load)
                     reward = self.qlearning_agent.calculate_reward(loss)
+                    print(f"loss: {loss}, reward: {reward}")
                     
                     # Next state
                     next_price = train_prices[t + 1]
